@@ -1,3 +1,7 @@
+name: Freeroam Drift & Fun
+version: 1.1.0
+author: Claude
+description: Freeroam szerver - HUD, custom ped, garazs (mentheto autok), teljes tuning, drift, nitro.
 
 $engine: 2
 $onesync: on
