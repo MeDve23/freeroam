@@ -1,0 +1,1337 @@
+
+$engine: 2
+$onesync: on
+
+tasks:
+  # 1) Alap cfx resource-ok
+  - action: download_github
+    src: https://github.com/citizenfx/cfx-server-data
+    ref: master
+    subpath: resources
+    dest: ./resources
+
+  # 2) Sajat freeroam resource mappak
+  - action: ensure_dir
+    path: ./resources/[local]/freeroam
+  - action: ensure_dir
+    path: ./resources/[local]/freeroam/html
+
+  - action: write_file
+    file: ./resources/[local]/freeroam/fxmanifest.lua
+    data: |
+      fx_version 'cerulean'
+      game 'gta5'
+      lua54 'yes'
+      author 'Claude'
+      description 'Freeroam: HUD, ped, garazs, tuning, drift, nitro'
+
+      ui_page 'html/index.html'
+
+      client_script 'client.lua'
+      server_script 'server.lua'
+
+      files {
+          'html/index.html',
+          'html/style.css',
+          'html/script.js'
+      }
+
+  # ================= SERVER =================
+  - action: write_file
+    file: ./resources/[local]/freeroam/server.lua
+    data: |
+      local RES = GetCurrentResourceName()
+      local db = {}
+
+      local function loadDb()
+          local raw = LoadResourceFile(RES, 'data.json')
+          if raw and raw ~= '' then
+              local ok, res = pcall(json.decode, raw)
+              if ok and type(res) == 'table' then db = res end
+          end
+      end
+
+      local function saveDb()
+          SaveResourceFile(RES, 'data.json', json.encode(db), -1)
+      end
+
+      loadDb()
+
+      local function getLicense(src)
+          for _, id in ipairs(GetPlayerIdentifiers(src)) do
+              if string.sub(id, 1, 8) == 'license:' then return id end
+          end
+          return nil
+      end
+
+      local function getEntry(src)
+          local id = getLicense(src)
+          if not id then return nil end
+          if type(db[id]) ~= 'table' then db[id] = { garage = {} } end
+          if type(db[id].garage) ~= 'table' then db[id].garage = {} end
+          return db[id]
+      end
+
+      local function sendData(src, e)
+          TriggerClientEvent('fr:data', src, e or { garage = {} })
+      end
+
+      AddEventHandler('playerJoining', function()
+          TriggerClientEvent('chat:addMessage', -1, { args = { '^2[Freeroam]', GetPlayerName(source) .. ' csatlakozott a szerverre!' } })
+      end)
+
+      RegisterNetEvent('fr:getData', function()
+          local src = source
+          sendData(src, getEntry(src))
+      end)
+
+      RegisterNetEvent('fr:saveCar', function(name, label, props)
+          local src = source
+          local e = getEntry(src)
+          if not e or type(props) ~= 'table' or type(props.model) ~= 'number' then return end
+          if #e.garage >= 25 then
+              TriggerClientEvent('fr:notify', src, '^1A garazsod tele van (max 25 auto).')
+              return
+          end
+          label = string.sub(tostring(label or 'Auto'), 1, 30)
+          name = string.sub(tostring(name or ''), 1, 30)
+          if name == '' then name = label end
+          table.insert(e.garage, {
+              id = tostring(os.time()) .. tostring(math.random(1000, 9999)),
+              name = name,
+              label = label,
+              props = props
+          })
+          saveDb()
+          TriggerClientEvent('fr:notify', src, 'Auto elmentve a garazsba: ^2' .. name)
+          sendData(src, e)
+      end)
+
+      RegisterNetEvent('fr:deleteCar', function(carId)
+          local src = source
+          local e = getEntry(src)
+          if not e then return end
+          for i, c in ipairs(e.garage) do
+              if c.id == carId then
+                  table.remove(e.garage, i)
+                  break
+              end
+          end
+          saveDb()
+          sendData(src, e)
+      end)
+
+      RegisterNetEvent('fr:savePed', function(model)
+          local src = source
+          local e = getEntry(src)
+          if not e then return end
+          if type(model) == 'string' and model ~= '' and #model <= 50 and string.match(model, '^[%w_]+$') then
+              e.ped = model
+          else
+              e.ped = nil
+          end
+          saveDb()
+          sendData(src, e)
+      end)
+
+  # ================= CLIENT =================
+  - action: write_file
+    file: ./resources/[local]/freeroam/client.lua
+    data: |
+      local data = { garage = {} }
+      local currentVeh = nil
+      local driftMode = false
+      local driftScore = 0.0
+      local bestScore = 0.0
+      local lastDrift = 0
+      local nitro = 100.0
+      local nitroActive = false
+      local fixedHour = nil
+      local menuOpen = false
+      local pendingPed = true
+      local DEFAULT_PED = 'a_m_y_skater_01'
+
+      local function notify(msg)
+          TriggerEvent('chat:addMessage', { args = { '^2[Freeroam]', msg } })
+          SendNUIMessage({ action = 'toast', text = (string.gsub(msg, '%^%d', '')) })
+      end
+
+      RegisterNetEvent('fr:notify', function(msg) notify(msg) end)
+
+      local function curVeh()
+          local v = GetVehiclePedIsIn(PlayerPedId(), false)
+          if v ~= 0 then
+              SetVehicleModKit(v, 0)
+              return v
+          end
+          return nil
+      end
+
+      -- ===== JARMU ADATOK MENTESE / BETOLTESE =====
+      local function getProps(veh)
+          SetVehicleModKit(veh, 0)
+          local p = {}
+          p.model = GetEntityModel(veh)
+          p.plate = GetVehicleNumberPlateText(veh)
+          p.plateIndex = GetVehicleNumberPlateTextIndex(veh)
+          p.wheelType = GetVehicleWheelType(veh)
+          p.tint = GetVehicleWindowTint(veh)
+          p.livery = GetVehicleLivery(veh)
+          p.xenon = GetVehicleXenonLightsColor(veh)
+          local c1, c2 = GetVehicleColours(veh)
+          p.colors = { c1, c2 }
+          local pearl, wheel = GetVehicleExtraColours(veh)
+          p.pearl = pearl
+          p.wheelColor = wheel
+          if GetIsVehiclePrimaryColourCustom(veh) then
+              p.customPrimary = { GetVehicleCustomPrimaryColour(veh) }
+          end
+          if GetIsVehicleSecondaryColourCustom(veh) then
+              p.customSecondary = { GetVehicleCustomSecondaryColour(veh) }
+          end
+          p.mods = {}
+          for i = 0, 49 do
+              if i < 17 or i > 22 then
+                  p.mods[tostring(i)] = GetVehicleMod(veh, i)
+              end
+          end
+          local ct = GetVehicleModVariation(veh, 23)
+          p.customTires = (ct == true or ct == 1)
+          p.toggles = {}
+          for i = 17, 22 do
+              p.toggles[tostring(i)] = IsToggleModOn(veh, i)
+          end
+          p.neon = {
+              IsVehicleNeonLightEnabled(veh, 0),
+              IsVehicleNeonLightEnabled(veh, 1),
+              IsVehicleNeonLightEnabled(veh, 2),
+              IsVehicleNeonLightEnabled(veh, 3)
+          }
+          p.neonColor = { GetVehicleNeonLightsColour(veh) }
+          p.smoke = { GetVehicleTyreSmokeColor(veh) }
+          return p
+      end
+
+      local function setProps(veh, p)
+          if type(p) ~= 'table' then return end
+          SetVehicleModKit(veh, 0)
+          if p.wheelType then SetVehicleWheelType(veh, p.wheelType) end
+          if p.colors then SetVehicleColours(veh, p.colors[1] or 0, p.colors[2] or 0) end
+          if p.pearl then SetVehicleExtraColours(veh, p.pearl, p.wheelColor or 0) end
+          if p.customPrimary then
+              SetVehicleCustomPrimaryColour(veh, p.customPrimary[1], p.customPrimary[2], p.customPrimary[3])
+          end
+          if p.customSecondary then
+              SetVehicleCustomSecondaryColour(veh, p.customSecondary[1], p.customSecondary[2], p.customSecondary[3])
+          end
+          if p.mods then
+              for k, v in pairs(p.mods) do
+                  local id = tonumber(k)
+                  local ct = (id == 23 or id == 24) and p.customTires == true
+                  SetVehicleMod(veh, id, v, ct)
+              end
+          end
+          if p.toggles then
+              for k, v in pairs(p.toggles) do
+                  ToggleVehicleMod(veh, tonumber(k), v == true)
+              end
+          end
+          if p.neon then
+              for i = 0, 3 do
+                  SetVehicleNeonLightEnabled(veh, i, p.neon[i + 1] == true)
+              end
+          end
+          if p.neonColor then SetVehicleNeonLightsColour(veh, p.neonColor[1], p.neonColor[2], p.neonColor[3]) end
+          if p.smoke then SetVehicleTyreSmokeColor(veh, p.smoke[1], p.smoke[2], p.smoke[3]) end
+          if p.xenon and p.xenon ~= 255 then SetVehicleXenonLightsColor(veh, p.xenon) end
+          if p.tint then SetVehicleWindowTint(veh, p.tint) end
+          if p.plateIndex then SetVehicleNumberPlateTextIndex(veh, p.plateIndex) end
+          if p.plate then SetVehicleNumberPlateText(veh, p.plate) end
+          if p.livery and p.livery >= 0 then SetVehicleLivery(veh, p.livery) end
+      end
+
+      -- ===== JARMU SPAWN =====
+      local function spawnVehicle(model, props)
+          local hash = type(model) == 'number' and model or GetHashKey(model)
+          if not IsModelInCdimage(hash) or not IsModelAVehicle(hash) then
+              notify('^1Nincs ilyen jarmu: ' .. tostring(model))
+              return nil
+          end
+          RequestModel(hash)
+          local tries = 0
+          while not HasModelLoaded(hash) and tries < 100 do
+              Wait(50)
+              tries = tries + 1
+          end
+          if not HasModelLoaded(hash) then return nil end
+          local ped = PlayerPedId()
+          local pos = GetEntityCoords(ped)
+          local heading = GetEntityHeading(ped)
+          if currentVeh and DoesEntityExist(currentVeh) then
+              SetEntityAsMissionEntity(currentVeh, true, true)
+              DeleteVehicle(currentVeh)
+          end
+          local veh = CreateVehicle(hash, pos.x, pos.y, pos.z, heading, true, false)
+          SetPedIntoVehicle(ped, veh, -1)
+          SetVehicleOnGroundProperly(veh)
+          SetEntityAsMissionEntity(veh, true, true)
+          SetModelAsNoLongerNeeded(hash)
+          if props then setProps(veh, props) end
+          SetVehicleEngineOn(veh, true, true, false)
+          currentVeh = veh
+          return veh
+      end
+
+      -- ===== TUNING =====
+      local modDefs = {
+          { id = 11, name = 'Motor', group = 'perf' },
+          { id = 12, name = 'Fek', group = 'perf' },
+          { id = 13, name = 'Valto', group = 'perf' },
+          { id = 15, name = 'Felfuggesztes', group = 'perf' },
+          { id = 16, name = 'Pancel', group = 'perf' },
+          { id = 0, name = 'Spoiler', group = 'body' },
+          { id = 1, name = 'Elso lokharito', group = 'body' },
+          { id = 2, name = 'Hatso lokharito', group = 'body' },
+          { id = 3, name = 'Kuszob', group = 'body' },
+          { id = 4, name = 'Kipufogo', group = 'body' },
+          { id = 5, name = 'Tuskeszeg / ketrec', group = 'body' },
+          { id = 6, name = 'Hutoracs', group = 'body' },
+          { id = 7, name = 'Motorhazteto', group = 'body' },
+          { id = 8, name = 'Bal sarveddo', group = 'body' },
+          { id = 9, name = 'Jobb sarveddo', group = 'body' },
+          { id = 10, name = 'Teto', group = 'body' },
+          { id = 14, name = 'Duda', group = 'body' },
+          { id = 23, name = 'Felni (elso)', group = 'wheels' },
+          { id = 24, name = 'Felni (hatso, motor)', group = 'wheels' },
+          { id = 48, name = 'Matrica / livery', group = 'other' },
+          { id = 25, name = 'Rendszamtarto', group = 'other' },
+          { id = 26, name = 'Rendszam dekor', group = 'other' },
+          { id = 27, name = 'Belso dekor', group = 'other' },
+          { id = 28, name = 'Dísz', group = 'other' },
+          { id = 29, name = 'Muszerfal', group = 'other' },
+          { id = 30, name = 'Oraszerkezet', group = 'other' },
+          { id = 31, name = 'Ajto hangszoro', group = 'other' },
+          { id = 32, name = 'Uleskek', group = 'other' },
+          { id = 33, name = 'Kormany', group = 'other' },
+          { id = 34, name = 'Valtogomb', group = 'other' },
+          { id = 35, name = 'Tablak', group = 'other' },
+          { id = 36, name = 'Hangszorok', group = 'other' },
+          { id = 37, name = 'Csomagtarto', group = 'other' },
+          { id = 38, name = 'Hidraulika', group = 'other' },
+          { id = 39, name = 'Motorblokk', group = 'other' },
+          { id = 40, name = 'Legszuro', group = 'other' },
+          { id = 41, name = 'Tamasztek', group = 'other' },
+          { id = 42, name = 'Kerekiv burkolat', group = 'other' },
+          { id = 43, name = 'Antennak', group = 'other' },
+          { id = 44, name = 'Extra dekor', group = 'other' },
+          { id = 45, name = 'Tank', group = 'other' },
+          { id = 46, name = 'Ablakok', group = 'other' }
+      }
+
+      local function buildTuning(veh)
+          SetVehicleModKit(veh, 0)
+          local mods = {}
+          for _, m in ipairs(modDefs) do
+              local count = GetNumVehicleMods(veh, m.id)
+              if count and count > 0 then
+                  local opts = {}
+                  for i = 0, count - 1 do
+                      local lbl = GetModTextLabel(veh, m.id, i)
+                      local txt = nil
+                      if lbl and lbl ~= '' then txt = GetLabelText(lbl) end
+                      if not txt or txt == 'NULL' or txt == '' then txt = m.name .. ' ' .. (i + 1) end
+                      opts[#opts + 1] = txt
+                  end
+                  mods[#mods + 1] = { id = m.id, name = m.name, group = m.group, cur = GetVehicleMod(veh, m.id), options = opts }
+              end
+          end
+          local pearl, wheel = GetVehicleExtraColours(veh)
+          local primary = { 136, 136, 136 }
+          local secondary = { 136, 136, 136 }
+          if GetIsVehiclePrimaryColourCustom(veh) then primary = { GetVehicleCustomPrimaryColour(veh) } end
+          if GetIsVehicleSecondaryColourCustom(veh) then secondary = { GetVehicleCustomSecondaryColour(veh) } end
+          local xenon = GetVehicleXenonLightsColor(veh)
+          if not xenon or xenon < 0 or xenon > 12 then xenon = 0 end
+          local state = {
+              turbo = IsToggleModOn(veh, 18),
+              xenon = IsToggleModOn(veh, 22),
+              smoke = IsToggleModOn(veh, 20),
+              tint = GetVehicleWindowTint(veh),
+              plateIndex = GetVehicleNumberPlateTextIndex(veh),
+              plate = GetVehicleNumberPlateText(veh),
+              wheelType = GetVehicleWheelType(veh),
+              xenonColor = xenon,
+              pearl = pearl,
+              wheelColor = wheel,
+              neon = {
+                  IsVehicleNeonLightEnabled(veh, 0),
+                  IsVehicleNeonLightEnabled(veh, 1),
+                  IsVehicleNeonLightEnabled(veh, 2),
+                  IsVehicleNeonLightEnabled(veh, 3)
+              },
+              neonColor = { GetVehicleNeonLightsColour(veh) },
+              smokeColor = { GetVehicleTyreSmokeColor(veh) },
+              primary = primary,
+              secondary = secondary
+          }
+          return { ok = true, mods = mods, state = state }
+      end
+
+      local function maxTune(veh, perfOnly)
+          SetVehicleModKit(veh, 0)
+          local list = perfOnly and { 11, 12, 13, 15, 16 } or { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16 }
+          for _, i in ipairs(list) do
+              local n = GetNumVehicleMods(veh, i)
+              if n and n > 0 then SetVehicleMod(veh, i, n - 1, false) end
+          end
+          ToggleVehicleMod(veh, 18, true)
+          if not perfOnly then ToggleVehicleMod(veh, 22, true) end
+      end
+
+      local function resetTune(veh)
+          SetVehicleModKit(veh, 0)
+          for i = 0, 49 do
+              if i < 17 or i > 22 then SetVehicleMod(veh, i, -1, false) end
+          end
+          for i = 17, 22 do ToggleVehicleMod(veh, i, false) end
+          for i = 0, 3 do SetVehicleNeonLightEnabled(veh, i, false) end
+          SetVehicleWindowTint(veh, 0)
+      end
+
+      -- ===== PED =====
+      local function applyPed(name)
+          local hash = GetHashKey(name)
+          if not IsModelInCdimage(hash) or not IsModelAPed(hash) then return false end
+          RequestModel(hash)
+          local tries = 0
+          while not HasModelLoaded(hash) and tries < 100 do
+              Wait(50)
+              tries = tries + 1
+          end
+          if not HasModelLoaded(hash) then return false end
+          SetPlayerModel(PlayerId(), hash)
+          SetModelAsNoLongerNeeded(hash)
+          local ped = PlayerPedId()
+          if name == 'mp_m_freemode_01' or name == 'mp_f_freemode_01' then
+              SetPedHeadBlendData(ped, 0, 0, 0, 0, 0, 0, 0.5, 0.5, 0.0, false)
+              SetPedRandomComponentVariation(ped, 0)
+          else
+              SetPedDefaultComponentVariation(ped)
+          end
+          GiveWeaponToPed(ped, GetHashKey('GADGET_PARACHUTE'), 1, false, false)
+          return true
+      end
+
+      -- ===== ADATOK A SZERVERTOL =====
+      RegisterNetEvent('fr:data', function(d)
+          data = d or { garage = {} }
+          if type(data.garage) ~= 'table' then data.garage = {} end
+          SendNUIMessage({ action = 'data', garage = data.garage, ped = data.ped })
+          if pendingPed then
+              pendingPed = false
+              if data.ped then
+                  CreateThread(function() applyPed(data.ped) end)
+              end
+          end
+      end)
+
+      -- ===== SPAWN =====
+      CreateThread(function()
+          while GetResourceState('spawnmanager') ~= 'started' do Wait(100) end
+          exports.spawnmanager:setAutoSpawn(true)
+          exports.spawnmanager:addSpawnPoint({ x = -1037.0, y = -2737.0, z = 20.2, heading = 330.0, idx = 1, model = GetHashKey(DEFAULT_PED) })
+          exports.spawnmanager:forceRespawn()
+          Wait(3000)
+          TriggerServerEvent('fr:getData')
+      end)
+
+      AddEventHandler('playerSpawned', function()
+          pendingPed = true
+          TriggerServerEvent('fr:getData')
+          GiveWeaponToPed(PlayerPedId(), GetHashKey('GADGET_PARACHUTE'), 1, false, false)
+          notify('Udv a szerveren! F5 = menu (jarmuvek, tuning, garazs, karakter) | /help')
+      end)
+
+      -- ===== MENU =====
+      local function openMenu(startTab)
+          if menuOpen then return end
+          menuOpen = true
+          SetNuiFocus(true, true)
+          TriggerServerEvent('fr:getData')
+          SendNUIMessage({ action = 'open', tab = startTab })
+      end
+
+      local function closeMenu()
+          menuOpen = false
+          SetNuiFocus(false, false)
+          SendNUIMessage({ action = 'close' })
+      end
+
+      RegisterCommand('freeroammenu', function()
+          if menuOpen then closeMenu() else openMenu() end
+      end, false)
+      RegisterKeyMapping('freeroammenu', 'Freeroam menu', 'keyboard', 'F5')
+      RegisterCommand('menu', function() openMenu() end, false)
+
+      AddEventHandler('onResourceStop', function(res)
+          if res == GetCurrentResourceName() then SetNuiFocus(false, false) end
+      end)
+
+      RegisterNUICallback('close', function(_, cb)
+          cb({ ok = true })
+          closeMenu()
+      end)
+
+      RegisterNUICallback('spawn', function(d, cb)
+          cb({ ok = true })
+          if d and d.model then spawnVehicle(tostring(d.model)) end
+      end)
+
+      RegisterNUICallback('getTuning', function(_, cb)
+          local veh = curVeh()
+          if not veh then
+              cb({ ok = false })
+              return
+          end
+          cb(buildTuning(veh))
+      end)
+
+      RegisterNUICallback('tune', function(d, cb)
+          cb({ ok = true })
+          local veh = curVeh()
+          if not veh or not d then return end
+          local t = d.type
+          if t == 'mod' then
+              SetVehicleMod(veh, d.id, d.value, false)
+          elseif t == 'toggle' then
+              ToggleVehicleMod(veh, d.id, d.value == true)
+          elseif t == 'tint' then
+              SetVehicleWindowTint(veh, d.value)
+          elseif t == 'plateIndex' then
+              SetVehicleNumberPlateTextIndex(veh, d.value)
+          elseif t == 'plateText' then
+              SetVehicleNumberPlateText(veh, string.sub(tostring(d.value or ''), 1, 8))
+          elseif t == 'neon' then
+              SetVehicleNeonLightEnabled(veh, d.index, d.value == true)
+          elseif t == 'neonColor' then
+              SetVehicleNeonLightsColour(veh, d.r, d.g, d.b)
+          elseif t == 'xenonColor' then
+              SetVehicleXenonLightsColor(veh, d.value)
+          elseif t == 'smokeColor' then
+              SetVehicleTyreSmokeColor(veh, d.r, d.g, d.b)
+          elseif t == 'primary' then
+              SetVehicleCustomPrimaryColour(veh, d.r, d.g, d.b)
+          elseif t == 'secondary' then
+              SetVehicleCustomSecondaryColour(veh, d.r, d.g, d.b)
+          elseif t == 'pearl' then
+              local _, w = GetVehicleExtraColours(veh)
+              SetVehicleExtraColours(veh, d.value, w)
+          elseif t == 'wheelColor' then
+              local p = GetVehicleExtraColours(veh)
+              SetVehicleExtraColours(veh, p, d.value)
+          elseif t == 'wheelType' then
+              SetVehicleWheelType(veh, d.value)
+              SetVehicleMod(veh, 23, -1, false)
+              SetVehicleMod(veh, 24, -1, false)
+          elseif t == 'maxPerf' then
+              maxTune(veh, true)
+          elseif t == 'maxAll' then
+              maxTune(veh, false)
+          elseif t == 'reset' then
+              resetTune(veh)
+          elseif t == 'repair' then
+              SetVehicleFixed(veh)
+              SetVehicleDeformationFixed(veh)
+              SetVehicleDirtLevel(veh, 0.0)
+              SetVehicleEngineHealth(veh, 1000.0)
+          end
+      end)
+
+      RegisterNUICallback('saveCar', function(d, cb)
+          cb({ ok = true })
+          local veh = curVeh()
+          if not veh then
+              notify('^1Ulj be abba az autoba, amit menteni szeretnel!')
+              return
+          end
+          local props = getProps(veh)
+          local dn = GetDisplayNameFromVehicleModel(props.model)
+          local label = GetLabelText(dn)
+          if not label or label == 'NULL' then label = dn end
+          TriggerServerEvent('fr:saveCar', d and d.name or '', label, props)
+      end)
+
+      RegisterNUICallback('loadCar', function(d, cb)
+          cb({ ok = true })
+          for _, c in ipairs(data.garage or {}) do
+              if c.id == d.id then
+                  spawnVehicle(math.floor(c.props.model), c.props)
+                  return
+              end
+          end
+      end)
+
+      RegisterNUICallback('deleteCar', function(d, cb)
+          cb({ ok = true })
+          TriggerServerEvent('fr:deleteCar', d.id)
+      end)
+
+      RegisterNUICallback('setPed', function(d, cb)
+          cb({ ok = true })
+          local name = tostring(d.model or '')
+          if applyPed(name) then
+              TriggerServerEvent('fr:savePed', name)
+              notify('Uj karakter: ^2' .. name)
+          else
+              notify('^1Nem letezo ped modell: ' .. name)
+          end
+      end)
+
+      RegisterNUICallback('resetPed', function(_, cb)
+          cb({ ok = true })
+          applyPed(DEFAULT_PED)
+          TriggerServerEvent('fr:savePed', '')
+          notify('Alap karakter visszaallitva.')
+      end)
+
+      -- ===== PARANCSOK =====
+      CreateThread(function()
+          Wait(2000)
+          TriggerEvent('chat:addSuggestion', '/menu', 'Freeroam menu (F5)')
+          TriggerEvent('chat:addSuggestion', '/car', 'Jarmu spawn', { { name = 'modell', help = 'pl. sultan, zentorno' } })
+          TriggerEvent('chat:addSuggestion', '/ped', 'Karakter modell', { { name = 'modell', help = 'pl. s_m_y_cop_01' } })
+          TriggerEvent('chat:addSuggestion', '/savecar', 'Jelenlegi auto mentese a garazsba', { { name = 'nev', help = 'opcionalis' } })
+          TriggerEvent('chat:addSuggestion', '/dv', 'Jarmu torlese')
+          TriggerEvent('chat:addSuggestion', '/fix', 'Jarmu javitasa')
+          TriggerEvent('chat:addSuggestion', '/tune', 'Gyors max tuning')
+          TriggerEvent('chat:addSuggestion', '/drift', 'Drift mod ki/be (Shift = drift)')
+          TriggerEvent('chat:addSuggestion', '/tp', 'Teleport a waypointra')
+          TriggerEvent('chat:addSuggestion', '/guns', 'Fegyverek')
+          TriggerEvent('chat:addSuggestion', '/heal', 'Elet + pancel')
+          TriggerEvent('chat:addSuggestion', '/time', 'Napszak', { { name = 'ora', help = '0-23 (ures = auto)' } })
+          TriggerEvent('chat:addSuggestion', '/weather', 'Idojaras', { { name = 'tipus', help = 'CLEAR, RAIN, THUNDER, FOGGY, XMAS' } })
+      end)
+
+      RegisterCommand('help', function()
+          notify('F5/menu: jarmuvek, tuning, garazs, karakter')
+          notify('/car /dv /fix /tune /savecar /ped /drift /tp /guns /heal /time /weather')
+          notify('Nitro: X | Drift: /drift, majd Shift')
+      end, false)
+
+      RegisterCommand('car', function(_, args)
+          spawnVehicle(args[1] or 'sultan')
+      end, false)
+
+      RegisterCommand('dv', function()
+          local veh = GetVehiclePedIsIn(PlayerPedId(), false)
+          if veh ~= 0 then
+              SetEntityAsMissionEntity(veh, true, true)
+              DeleteVehicle(veh)
+          end
+      end, false)
+
+      RegisterCommand('fix', function()
+          local veh = GetVehiclePedIsIn(PlayerPedId(), false)
+          if veh == 0 then return end
+          SetVehicleFixed(veh)
+          SetVehicleDeformationFixed(veh)
+          SetVehicleDirtLevel(veh, 0.0)
+          SetVehicleEngineHealth(veh, 1000.0)
+      end, false)
+
+      RegisterCommand('tune', function()
+          local veh = curVeh()
+          if not veh then notify('^1Ulj be egy autoba!') return end
+          maxTune(veh, false)
+          notify('Auto maxra tuningolva. Reszletes tuning: F5 menu.')
+      end, false)
+
+      RegisterCommand('savecar', function(_, args)
+          local veh = curVeh()
+          if not veh then notify('^1Ulj be egy autoba!') return end
+          local props = getProps(veh)
+          local dn = GetDisplayNameFromVehicleModel(props.model)
+          local label = GetLabelText(dn)
+          if not label or label == 'NULL' then label = dn end
+          TriggerServerEvent('fr:saveCar', table.concat(args, ' '), label, props)
+      end, false)
+
+      RegisterCommand('ped', function(_, args)
+          local name = args[1]
+          if not name then notify('Hasznalat: /ped [modell], pl. /ped s_m_y_cop_01') return end
+          if applyPed(name) then
+              TriggerServerEvent('fr:savePed', name)
+              notify('Uj karakter: ^2' .. name)
+          else
+              notify('^1Nem letezo ped modell: ' .. name)
+          end
+      end, false)
+
+      RegisterCommand('drift', function()
+          driftMode = not driftMode
+          notify(driftMode and 'Drift mod ^2BE^7 - tartsd a Shift-et!' or 'Drift mod ^1KI')
+          if not driftMode then
+              local veh = GetVehiclePedIsIn(PlayerPedId(), false)
+              if veh ~= 0 then
+                  SetVehicleReduceGrip(veh, false)
+                  SetVehicleEnginePowerMultiplier(veh, 0.0)
+              end
+          end
+      end, false)
+
+      RegisterCommand('guns', function()
+          local ped = PlayerPedId()
+          local weapons = { 'WEAPON_PISTOL', 'WEAPON_COMBATPISTOL', 'WEAPON_SMG', 'WEAPON_CARBINERIFLE', 'WEAPON_PUMPSHOTGUN', 'WEAPON_SNIPERRIFLE', 'WEAPON_RPG', 'WEAPON_KNIFE', 'WEAPON_BAT' }
+          for _, w in ipairs(weapons) do
+              GiveWeaponToPed(ped, GetHashKey(w), 250, false, false)
+          end
+          notify('Fegyverek megkapva.')
+      end, false)
+
+      RegisterCommand('heal', function()
+          local ped = PlayerPedId()
+          SetEntityHealth(ped, GetEntityMaxHealth(ped))
+          SetPedArmour(ped, 100)
+          notify('Feltoltve.')
+      end, false)
+
+      RegisterCommand('tp', function()
+          local blip = GetFirstBlipInfoId(8)
+          if not DoesBlipExist(blip) then notify('^1Tegyel waypointot a terkepen!') return end
+          local c = GetBlipInfoIdCoord(blip)
+          local ped = PlayerPedId()
+          local ent = GetVehiclePedIsIn(ped, false)
+          if ent == 0 then ent = ped end
+          FreezeEntityPosition(ent, true)
+          for h = 800.0, 0.0, -25.0 do
+              SetEntityCoordsNoOffset(ent, c.x, c.y, h, false, false, false)
+              RequestCollisionAtCoord(c.x, c.y, h)
+              Wait(10)
+              local ok, gz = GetGroundZFor_3dCoord(c.x, c.y, h, false)
+              if ok then
+                  SetEntityCoordsNoOffset(ent, c.x, c.y, gz + 1.0, false, false, false)
+                  break
+              end
+          end
+          FreezeEntityPosition(ent, false)
+      end, false)
+
+      RegisterCommand('time', function(_, args)
+          local h = tonumber(args[1])
+          if h then
+              fixedHour = math.floor(h) % 24
+              notify('Ido beallitva: ' .. fixedHour .. ':00')
+          else
+              fixedHour = nil
+              notify('Ido: automatikus')
+          end
+      end, false)
+
+      RegisterCommand('weather', function(_, args)
+          local w = string.upper(args[1] or 'CLEAR')
+          ClearOverrideWeather()
+          ClearWeatherTypePersist()
+          SetWeatherTypeOvertimePersist(w, 5.0)
+          SetWeatherTypeNowPersist(w)
+          SetWeatherTypeNow(w)
+          SetOverrideWeather(w)
+          notify('Idojaras: ' .. w)
+      end, false)
+
+      -- ===== VILAG: kevesebb NPC, nincs wanted, alap HUD elemek elrejtese =====
+      CreateThread(function()
+          SetMaxWantedLevel(0)
+          while true do
+              SetVehicleDensityMultiplierThisFrame(0.2)
+              SetRandomVehicleDensityMultiplierThisFrame(0.2)
+              SetParkedVehicleDensityMultiplierThisFrame(0.2)
+              SetPedDensityMultiplierThisFrame(0.3)
+              SetScenarioPedDensityMultiplierThisFrame(0.3, 0.3)
+              ClearPlayerWantedLevel(PlayerId())
+              HideHudComponentThisFrame(1)
+              HideHudComponentThisFrame(3)
+              HideHudComponentThisFrame(4)
+              HideHudComponentThisFrame(6)
+              HideHudComponentThisFrame(7)
+              HideHudComponentThisFrame(8)
+              HideHudComponentThisFrame(9)
+              if fixedHour then NetworkOverrideClockTime(fixedHour, 0, 0) end
+              Wait(0)
+          end
+      end)
+
+      -- ===== NITRO + DRIFT =====
+      CreateThread(function()
+          while true do
+              local ped = PlayerPedId()
+              local veh = GetVehiclePedIsIn(ped, false)
+              if veh ~= 0 and GetPedInVehicleSeat(veh, -1) == ped then
+                  local speed = GetEntitySpeed(veh) * 3.6
+
+                  if IsControlPressed(0, 73) and nitro > 0.0 and not menuOpen then
+                      nitroActive = true
+                      SetVehicleCheatPowerIncrease(veh, 2.5)
+                      SetVehicleBoostActive(veh, true)
+                      nitro = math.max(0.0, nitro - 0.6)
+                  else
+                      if nitroActive then
+                          nitroActive = false
+                          SetVehicleCheatPowerIncrease(veh, 1.0)
+                          SetVehicleBoostActive(veh, false)
+                      end
+                      nitro = math.min(100.0, nitro + 0.15)
+                  end
+
+                  if driftMode then
+                      local shift = IsControlPressed(0, 21)
+                      SetVehicleReduceGrip(veh, shift)
+                      SetVehicleEnginePowerMultiplier(veh, shift and 25.0 or 0.0)
+                      local vel = GetEntityVelocity(veh)
+                      local fwd = GetEntityForwardVector(veh)
+                      local hs = math.sqrt(vel.x * vel.x + vel.y * vel.y)
+                      local fl = math.sqrt(fwd.x * fwd.x + fwd.y * fwd.y)
+                      if hs > 4.0 and fl > 0.01 then
+                          local dot = (vel.x * fwd.x + vel.y * fwd.y) / (hs * fl)
+                          dot = math.max(-1.0, math.min(1.0, dot))
+                          local angle = math.deg(math.acos(dot))
+                          if angle > 12.0 and angle < 100.0 and speed > 25.0 and IsVehicleOnAllWheels(veh) then
+                              driftScore = driftScore + angle * speed * 0.0004
+                              lastDrift = GetGameTimer()
+                          end
+                      end
+                      if driftScore > 0 and GetGameTimer() - lastDrift > 2000 then
+                          if driftScore > bestScore then bestScore = driftScore end
+                          notify(string.format('Drift pontszam: ^2%d^7 (rekord: %d)', math.floor(driftScore), math.floor(bestScore)))
+                          driftScore = 0.0
+                      end
+                  end
+                  Wait(0)
+              else
+                  nitroActive = false
+                  Wait(300)
+              end
+          end
+      end)
+
+      -- ===== HUD (NUI) =====
+      CreateThread(function()
+          while true do
+              local ped = PlayerPedId()
+              local veh = GetVehiclePedIsIn(ped, false)
+              local inVeh = (veh ~= 0)
+              local c = GetEntityCoords(ped)
+              local s1 = GetStreetNameAtCoord(c.x, c.y, c.z)
+              local street = GetStreetNameFromHashKey(s1)
+              local zone = GetLabelText(GetNameOfZone(c.x, c.y, c.z))
+              local maxHp = math.max(1, GetEntityMaxHealth(ped) - 100)
+              local hp = math.max(0, GetEntityHealth(ped) - 100)
+              local msg = {
+                  action = 'hud',
+                  street = street,
+                  zone = zone,
+                  id = GetPlayerServerId(PlayerId()),
+                  clock = string.format('%02d:%02d', GetClockHours(), GetClockMinutes()),
+                  hp = math.floor(hp / maxHp * 100),
+                  armor = GetPedArmour(ped),
+                  inVeh = inVeh,
+                  nitro = math.floor(nitro),
+                  nitroActive = nitroActive,
+                  drift = math.floor(driftScore),
+                  best = math.floor(bestScore)
+              }
+              if inVeh then
+                  msg.speed = math.floor(GetEntitySpeed(veh) * 3.6)
+                  msg.gear = GetVehicleCurrentGear(veh)
+                  msg.rpm = GetVehicleCurrentRpm(veh)
+              end
+              SendNUIMessage(msg)
+              Wait(inVeh and 50 or 250)
+          end
+      end)
+
+  # ================= NUI: HTML =================
+  - action: write_file
+    file: ./resources/[local]/freeroam/html/index.html
+    data: |
+      <!DOCTYPE html>
+      <html lang="hu">
+      <head>
+        <meta charset="utf-8">
+        <link rel="stylesheet" href="style.css">
+      </head>
+      <body>
+        <div id="hud">
+          <div id="topleft">
+            <div id="street">-</div>
+            <div id="zone">-</div>
+          </div>
+          <div id="topright">
+            <span class="brand">FREEROAM</span>
+            <span id="pid"></span>
+            <span id="clock"></span>
+            <span class="hint">F5 menu</span>
+          </div>
+          <div id="drift" class="hidden">
+            <div class="dlabel">DRIFT</div>
+            <div id="driftscore">0</div>
+            <div class="dbest">REKORD <span id="driftbest">0</span></div>
+          </div>
+          <div id="bars">
+            <div class="bar hp"><div id="hpfill"></div></div>
+            <div class="bar ar"><div id="arfill"></div></div>
+          </div>
+          <div id="speedo" class="hidden">
+            <div class="srow">
+              <div id="speed">0</div>
+              <div class="sside">
+                <div class="unit">KM/H</div>
+                <div id="gear">N</div>
+              </div>
+            </div>
+            <div class="bar rpm"><div id="rpmfill"></div></div>
+            <div class="nlabel">NITRO <span class="key">X</span></div>
+            <div class="bar nitro"><div id="nitrofill"></div></div>
+          </div>
+        </div>
+
+        <div id="toasts"></div>
+
+        <div id="menu" class="hidden">
+          <div class="panel">
+            <div class="head">
+              <h1>FREEROAM</h1>
+              <button id="closebtn">&#10005;</button>
+            </div>
+            <div class="tabs" id="tabs"></div>
+            <div class="content" id="content"></div>
+          </div>
+        </div>
+
+        <script src="script.js"></script>
+      </body>
+      </html>
+
+  # ================= NUI: CSS =================
+  - action: write_file
+    file: ./resources/[local]/freeroam/html/style.css
+    data: |
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      :root { --acc: #ff2e63; --acc2: #08d9d6; --bg: rgba(14, 16, 24, 0.92); --line: rgba(255, 255, 255, 0.09); }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; font-family: 'Segoe UI', Arial, sans-serif; color: #fff; user-select: none; }
+      .hidden { display: none !important; }
+
+      /* ---------- HUD ---------- */
+      #hud > div { position: absolute; }
+      #topleft { top: 1.6vh; left: 1.2vw; text-shadow: 0 1px 4px #000; }
+      #street { font-size: 1.9vh; font-weight: 700; letter-spacing: 1px; }
+      #zone { font-size: 1.4vh; opacity: 0.75; }
+      #topright { top: 1.6vh; right: 1.2vw; display: flex; gap: 0.8vw; align-items: center; background: var(--bg); padding: 0.7vh 1vw; border-radius: 8px; border-left: 3px solid var(--acc); font-size: 1.4vh; }
+      .brand { font-weight: 800; letter-spacing: 2px; color: var(--acc); }
+      .hint { opacity: 0.6; }
+
+      #drift { top: 9vh; left: 50%; transform: translateX(-50%); text-align: center; text-shadow: 0 2px 8px #000; }
+      .dlabel { font-size: 1.6vh; letter-spacing: 6px; color: var(--acc2); font-weight: 700; }
+      #driftscore { font-size: 6vh; font-weight: 900; line-height: 1; color: #ffd400; }
+      .dbest { font-size: 1.3vh; opacity: 0.7; }
+
+      #bars { bottom: 2.2vh; left: 50%; transform: translateX(-50%); width: 18vw; display: flex; flex-direction: column; gap: 0.6vh; }
+      .bar { height: 0.9vh; background: rgba(255, 255, 255, 0.14); border-radius: 6px; overflow: hidden; }
+      .bar div { height: 100%; width: 0; border-radius: 6px; transition: width 0.15s linear; }
+      .hp div { background: linear-gradient(90deg, #ff2e63, #ff6b81); }
+      .ar div { background: linear-gradient(90deg, #08a0d9, #08d9d6); }
+
+      #speedo { bottom: 2.4vh; right: 1.6vw; width: 17vw; background: var(--bg); padding: 1.4vh 1.2vw; border-radius: 12px; border-bottom: 3px solid var(--acc); }
+      .srow { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 0.8vh; }
+      #speed { font-size: 6.4vh; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; }
+      .sside { text-align: right; }
+      .unit { font-size: 1.4vh; opacity: 0.6; letter-spacing: 2px; }
+      #gear { font-size: 3.4vh; font-weight: 800; color: var(--acc2); }
+      .rpm div { background: linear-gradient(90deg, #08d9d6, #ffd400, #ff2e63); }
+      .nlabel { font-size: 1.2vh; letter-spacing: 2px; margin: 1vh 0 0.4vh; opacity: 0.8; }
+      .key { background: rgba(255, 255, 255, 0.18); padding: 0 5px; border-radius: 4px; }
+      .nitro div { background: linear-gradient(90deg, #3a7bff, #08d9d6); }
+      .nitro.active { box-shadow: 0 0 12px #3a7bff; }
+
+      #toasts { position: fixed; top: 9vh; right: 1.2vw; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+      .toast { background: var(--bg); border-left: 3px solid var(--acc2); padding: 8px 14px; border-radius: 6px; font-size: 1.5vh; animation: fadein 0.2s ease; max-width: 26vw; }
+      @keyframes fadein { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: none; } }
+
+      /* ---------- MENU ---------- */
+      #menu { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.45); }
+      .panel { width: 62vw; max-width: 980px; height: 78vh; background: var(--bg); border-radius: 14px; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6); }
+      .head { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); background: linear-gradient(90deg, rgba(255, 46, 99, 0.25), transparent); }
+      .head h1 { font-size: 20px; letter-spacing: 4px; }
+      #closebtn { background: none; border: none; color: #fff; font-size: 18px; cursor: pointer; opacity: 0.7; }
+      #closebtn:hover { opacity: 1; color: var(--acc); }
+      .tabs { display: flex; gap: 6px; padding: 10px 14px 0; border-bottom: 1px solid var(--line); }
+      .tab { padding: 10px 18px; cursor: pointer; border-radius: 8px 8px 0 0; font-size: 14px; opacity: 0.65; border-bottom: 3px solid transparent; }
+      .tab:hover { opacity: 1; }
+      .tab.on { opacity: 1; border-bottom-color: var(--acc); background: rgba(255, 255, 255, 0.05); }
+      .content { flex: 1; overflow-y: auto; padding: 16px 20px 24px; }
+      .content::-webkit-scrollbar { width: 8px; }
+      .content::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
+
+      .sec { margin-bottom: 22px; }
+      .sec h3 { font-size: 13px; letter-spacing: 2px; text-transform: uppercase; color: var(--acc2); margin-bottom: 10px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+      .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px 16px; }
+      .field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+      .field label { opacity: 0.75; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+      .btn { background: rgba(255, 255, 255, 0.08); color: #fff; border: 1px solid var(--line); padding: 9px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+      .btn:hover { background: var(--acc); border-color: var(--acc); }
+      .btn.on { background: rgba(8, 217, 214, 0.25); border-color: var(--acc2); }
+      .btn.danger:hover { background: #b00020; }
+      select, input[type=text] { background: rgba(255, 255, 255, 0.08); color: #fff; border: 1px solid var(--line); padding: 8px 10px; border-radius: 8px; font-size: 13px; outline: none; }
+      select option { background: #1a1d2b; color: #fff; }
+      input[type=text] { user-select: text; }
+      input[type=color] { width: 100%; height: 34px; border: 1px solid var(--line); border-radius: 8px; background: none; cursor: pointer; }
+      input[type=range] { width: 100%; }
+      .chk { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+      .muted, .empty { opacity: 0.6; font-size: 14px; padding: 20px 0; }
+      .car { display: flex; justify-content: space-between; align-items: center; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; }
+      .car .nm { font-weight: 600; }
+      .car .sub { font-size: 12px; opacity: 0.6; }
+      .car .acts { display: flex; gap: 6px; }
+
+  # ================= NUI: JS =================
+  - action: write_file
+    file: ./resources/[local]/freeroam/html/script.js
+    data: |
+      var RES = (typeof GetParentResourceName === 'function') ? GetParentResourceName() : 'freeroam';
+      var menuOpen = false;
+      var tab = 'cars';
+      var garage = [];
+      var pedSaved = null;
+
+      function post(name, data) {
+        return fetch('https://' + RES + '/' + name, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+          body: JSON.stringify(data || {})
+        }).then(function (r) { return r.json(); }).catch(function () { return {}; });
+      }
+
+      function el(id) { return document.getElementById(id); }
+
+      function h(tag, attrs, kids) {
+        var e = document.createElement(tag);
+        attrs = attrs || {};
+        Object.keys(attrs).forEach(function (k) {
+          var v = attrs[k];
+          if (k === 'class') e.className = v;
+          else if (k === 'text') e.textContent = v;
+          else if (k === 'value' || k === 'checked') return;
+          else if (k.indexOf('on') === 0) e.addEventListener(k.slice(2), v);
+          else e.setAttribute(k, v);
+        });
+        (kids || []).forEach(function (c) {
+          if (c) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+        });
+        if ('value' in attrs) e.value = attrs.value;
+        if ('checked' in attrs) e.checked = !!attrs.checked;
+        return e;
+      }
+
+      function btn(label, fn, cls) { return h('button', { 'class': 'btn ' + (cls || ''), text: label, onclick: fn }); }
+      function section(title, nodes) { return h('div', { 'class': 'sec' }, [h('h3', { text: title })].concat(nodes)); }
+      function field(label, control) { return h('div', { 'class': 'field' }, [h('label', { text: label }), control]); }
+
+      function sel(opts, cur, fn) {
+        var s = h('select', {}, opts.map(function (o) { return h('option', { value: String(o[0]), text: o[1] }); }));
+        s.value = String(cur);
+        s.addEventListener('change', function () { fn(parseInt(s.value, 10)); });
+        return s;
+      }
+
+      function check(label, on, fn) {
+        var i = h('input', { type: 'checkbox', checked: on });
+        i.addEventListener('change', function () { fn(i.checked); });
+        return h('label', { 'class': 'chk' }, [i, label]);
+      }
+
+      function range(min, max, cur, fn) {
+        var r = h('input', { type: 'range', min: min, max: max, value: cur });
+        r.addEventListener('change', function () { fn(parseInt(r.value, 10)); });
+        return r;
+      }
+
+      function hexToRgb(hex) {
+        var n = parseInt(hex.slice(1), 16);
+        return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+      }
+      function rgbToHex(a) {
+        a = a || [136, 136, 136];
+        return '#' + a.map(function (v) { return ('0' + Math.round(v).toString(16)).slice(-2); }).join('');
+      }
+      function colorPick(arr, send) {
+        var inp = h('input', { type: 'color', value: rgbToHex(arr) });
+        var last = 0;
+        inp.addEventListener('input', function () {
+          var n = Date.now();
+          if (n - last > 90) { last = n; send(hexToRgb(inp.value)); }
+        });
+        inp.addEventListener('change', function () { send(hexToRgb(inp.value)); });
+        return inp;
+      }
+
+      function tune(obj) { return post('tune', obj); }
+      function act(type) { tune({ type: type }).then(renderTuning); }
+
+      /* ---------------- DATA ---------------- */
+      var VEHICLES = [
+        { name: 'Drift / JDM', list: [['sultan', 'Sultan'], ['sultanrs', 'Sultan RS'], ['elegy2', 'Elegy RH8'], ['futo', 'Futo'], ['jester', 'Jester'], ['jester3', 'Jester Classic'], ['kuruma', 'Kuruma'], ['calico', 'Calico GTF'], ['zr350', 'ZR350'], ['remus', 'Remus'], ['previon', 'Previon'], ['rt3000', 'RT3000'], ['vectre', 'Vectre'], ['growler', 'Growler'], ['cypher', 'Cypher'], ['comet6', 'Comet S2']] },
+        { name: 'Muscle', list: [['dominator', 'Dominator'], ['dominator3', 'Dominator GTX'], ['gauntlet', 'Gauntlet'], ['gauntlet3', 'Gauntlet Classic'], ['buffalo3', 'Buffalo Sprunk'], ['sabregt', 'Sabre Turbo'], ['tampa', 'Tampa'], ['hotknife', 'Hotknife'], ['dukes', 'Dukes'], ['ruiner', 'Ruiner'], ['vigero', 'Vigero']] },
+        { name: 'Szuper', list: [['zentorno', 'Zentorno'], ['adder', 'Adder'], ['t20', 'T20'], ['osiris', 'Osiris'], ['turismor', 'Turismo R'], ['entityxf', 'Entity XF'], ['vacca', 'Vacca'], ['infernus', 'Infernus'], ['banshee2', 'Banshee 900R'], ['nero', 'Nero'], ['emerus', 'Emerus'], ['krieger', 'Krieger'], ['thrax', 'Thrax'], ['deveste', 'Deveste Eight'], ['tyrant', 'Tyrant']] },
+        { name: 'Sport', list: [['comet2', 'Comet'], ['carbonizzare', 'Carbonizzare'], ['feltzer2', 'Feltzer'], ['massacro', 'Massacro'], ['ninef', '9F'], ['rapidgt', 'Rapid GT'], ['surano', 'Surano'], ['schwartzer', 'Schwartzer'], ['coquette', 'Coquette'], ['lynx', 'Lynx']] },
+        { name: 'Motorok', list: [['bati', 'Bati 801'], ['hakuchou', 'Hakuchou'], ['akuma', 'Akuma'], ['sanchez', 'Sanchez'], ['shotaro', 'Shotaro'], ['double', 'Double-T'], ['ruffian', 'Ruffian'], ['nemesis', 'Nemesis'], ['bf400', 'BF400'], ['manchez', 'Manchez']] },
+        { name: 'Terep', list: [['bifta', 'Bifta'], ['dune', 'Dune Buggy'], ['bfinjection', 'BF Injection'], ['sandking', 'Sandking'], ['kamacho', 'Kamacho'], ['trophytruck', 'Trophy Truck'], ['blazer', 'Blazer'], ['monster', 'Monster Truck'], ['marshall', 'Marshall']] },
+        { name: 'Fun / Különleges', list: [['rhino', 'Tank'], ['deluxo', 'Deluxo'], ['oppressor2', 'Oppressor MK2'], ['rcbandito', 'RC Bandito'], ['ratloader', 'Rat Loader'], ['bmx', 'BMX'], ['faggio', 'Faggio'], ['caddy', 'Caddy'], ['veto', 'Veto'], ['stunt', 'Stunt Plane'], ['frogger', 'Frogger'], ['hydra', 'Hydra'], ['lazer', 'Lazer'], ['dodo', 'Dodo']] }
+      ];
+
+      var PEDS = [
+        ['a_m_y_skater_01', 'Gördeszkás'], ['a_m_y_hipster_01', 'Hipster'], ['a_m_y_beach_01', 'Strandoló'], ['a_m_y_musclbeac_01', 'Izmos'],
+        ['a_f_y_beach_01', 'Strandoló (nő)'], ['a_f_y_hipster_01', 'Hipster (nő)'], ['a_f_y_tourist_01', 'Turista (nő)'], ['a_m_m_business_01', 'Üzletember'],
+        ['s_m_y_cop_01', 'Rendőr'], ['s_m_y_swat_01', 'SWAT'], ['s_m_y_marine_01', 'Tengerészgyalogos'], ['s_m_m_pilot_01', 'Pilóta'],
+        ['s_m_m_movspace_01', 'Űrhajós'], ['s_m_y_clown_01', 'Bohóc'], ['player_zero', 'Michael'], ['player_one', 'Franklin'],
+        ['player_two', 'Trevor'], ['u_m_m_jesus_01', 'Jézus'], ['u_m_y_juggernaut_01', 'Juggernaut'], ['u_m_y_zombie_01', 'Zombi'],
+        ['s_m_m_movalien_01', 'Űrlény'], ['u_m_y_pogo_01', 'Pogo'], ['mp_m_freemode_01', 'Freemode (férfi)'], ['mp_f_freemode_01', 'Freemode (nő)']
+      ];
+
+      var GROUPS = [['perf', 'Teljesítmény'], ['body', 'Karosszéria'], ['wheels', 'Kerekek'], ['other', 'Egyéb']];
+      var WHEEL_TYPES = [[0, 'Sport'], [1, 'Muscle'], [2, 'Lowrider'], [3, 'SUV'], [4, 'Terep'], [5, 'Tuner'], [6, 'Motor'], [7, 'High End'], [8, "Benny's Original"], [9, "Benny's Bespoke"]];
+      var TINTS = [[0, 'Nincs'], [1, 'Pure Black'], [2, 'Dark Smoke'], [3, 'Light Smoke'], [4, 'Stock'], [5, 'Limo'], [6, 'Green']];
+      var PLATES = [[0, 'Kék/Fehér 1'], [1, 'Sárga/Fekete'], [2, 'Sárga/Kék'], [3, 'Kék/Fehér 2'], [4, 'Kék/Fehér 3'], [5, 'Yankton']];
+      var XENON = [[0, 'Fehér'], [1, 'Kék'], [2, 'Elektromos kék'], [3, 'Menta'], [4, 'Lime'], [5, 'Sárga'], [6, 'Arany'], [7, 'Narancs'], [8, 'Piros'], [9, 'Rózsaszín (pony)'], [10, 'Pink'], [11, 'Lila'], [12, 'Fekete fény']];
+
+      /* ---------------- TABS ---------------- */
+      var TABS = [['cars', 'Járművek'], ['tune', 'Tuning'], ['garage', 'Garázs'], ['ped', 'Karakter']];
+
+      function renderTabs() {
+        var t = el('tabs');
+        t.innerHTML = '';
+        TABS.forEach(function (x) {
+          t.appendChild(h('div', { 'class': 'tab' + (tab === x[0] ? ' on' : ''), text: x[1], onclick: function () { tab = x[0]; render(); } }));
+        });
+      }
+
+      function render() {
+        renderTabs();
+        if (tab === 'cars') renderCars();
+        else if (tab === 'tune') renderTuning();
+        else if (tab === 'garage') renderGarage();
+        else renderPed();
+      }
+
+      function renderCars() {
+        var box = el('content');
+        box.innerHTML = '';
+        var inp = h('input', { type: 'text', placeholder: 'Bármely modell neve (pl. zentorno)' });
+        var go = function () { if (inp.value.trim()) post('spawn', { model: inp.value.trim() }); };
+        inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') go(); });
+        box.appendChild(h('div', { 'class': 'row' }, [inp, btn('Spawn', go)]));
+        VEHICLES.forEach(function (cat) {
+          var grid = h('div', { 'class': 'grid' }, cat.list.map(function (v) {
+            return btn(v[1], function () { post('spawn', { model: v[0] }); });
+          }));
+          box.appendChild(section(cat.name, [grid]));
+        });
+      }
+
+      function renderTuning() {
+        var box = el('content');
+        box.innerHTML = '';
+        box.appendChild(h('div', { 'class': 'muted', text: 'Betöltés...' }));
+        post('getTuning').then(function (d) {
+          box.innerHTML = '';
+          if (!d || !d.ok) {
+            box.appendChild(h('div', { 'class': 'empty', text: 'Ülj be egy járműbe a tuninghoz!' }));
+            return;
+          }
+          var s = d.state;
+          box.appendChild(h('div', { 'class': 'row' }, [
+            btn('Max teljesítmény', function () { act('maxPerf'); }),
+            btn('Max tuning', function () { act('maxAll'); }),
+            btn('Alaphelyzet', function () { act('reset'); }),
+            btn('Javítás', function () { act('repair'); })
+          ]));
+
+          GROUPS.forEach(function (g) {
+            var nodes = [];
+            d.mods.filter(function (m) { return m.group === g[0]; }).forEach(function (m) {
+              var opts = [[-1, 'Alap']].concat(m.options.map(function (o, i) { return [i, o]; }));
+              nodes.push(field(m.name, sel(opts, m.cur, function (v) { tune({ type: 'mod', id: m.id, value: v }); })));
+            });
+            if (g[0] === 'perf') {
+              nodes.push(h('div', { 'class': 'field' }, [check('Turbó', s.turbo, function (v) { tune({ type: 'toggle', id: 18, value: v }); })]));
+            }
+            if (g[0] === 'wheels') {
+              nodes.unshift(field('Felni típus', sel(WHEEL_TYPES, s.wheelType, function (v) {
+                tune({ type: 'wheelType', value: v }).then(renderTuning);
+              })));
+              nodes.push(h('div', { 'class': 'field' }, [check('Gumifüst', s.smoke, function (v) { tune({ type: 'toggle', id: 20, value: v }); })]));
+              nodes.push(field('Gumifüst színe', colorPick(s.smokeColor, function (c) { tune({ type: 'smokeColor', r: c.r, g: c.g, b: c.b }); })));
+            }
+            if (nodes.length) box.appendChild(section(g[1], [h('div', { 'class': 'fields' }, nodes)]));
+          });
+
+          box.appendChild(section('Színek', [h('div', { 'class': 'fields' }, [
+            field('Elsődleges szín', colorPick(s.primary, function (c) { tune({ type: 'primary', r: c.r, g: c.g, b: c.b }); })),
+            field('Másodlagos szín', colorPick(s.secondary, function (c) { tune({ type: 'secondary', r: c.r, g: c.g, b: c.b }); })),
+            field('Gyöngyház (0-159)', range(0, 159, s.pearl || 0, function (v) { tune({ type: 'pearl', value: v }); })),
+            field('Felni szín (0-159)', range(0, 159, s.wheelColor || 0, function (v) { tune({ type: 'wheelColor', value: v }); }))
+          ])]));
+
+          var neonNames = ['Bal', 'Jobb', 'Elöl', 'Hátul'];
+          var neonChecks = neonNames.map(function (n, i) {
+            return check('Neon: ' + n, s.neon[i], function (v) { tune({ type: 'neon', index: i, value: v }); });
+          });
+          var plate = h('input', { type: 'text', maxlength: '8', value: s.plate || '' });
+          box.appendChild(section('Fények, ablak, rendszám', [h('div', { 'class': 'fields' }, neonChecks.concat([
+            field('Neon szín', colorPick(s.neonColor, function (c) { tune({ type: 'neonColor', r: c.r, g: c.g, b: c.b }); })),
+            h('div', { 'class': 'field' }, [check('Xenon', s.xenon, function (v) { tune({ type: 'toggle', id: 22, value: v }); })]),
+            field('Xenon szín', sel(XENON, s.xenonColor, function (v) { tune({ type: 'xenonColor', value: v }); })),
+            field('Ablak sötétítés', sel(TINTS, s.tint, function (v) { tune({ type: 'tint', value: v }); })),
+            field('Rendszám stílus', sel(PLATES, s.plateIndex, function (v) { tune({ type: 'plateIndex', value: v }); })),
+            field('Rendszám szöveg', h('div', { 'class': 'row' }, [plate, btn('OK', function () { tune({ type: 'plateText', value: plate.value }); })]))
+          ]))]));
+        });
+      }
+
+      function renderGarage() {
+        var box = el('content');
+        box.innerHTML = '';
+        var name = h('input', { type: 'text', maxlength: '30', placeholder: 'Név (opcionális)' });
+        box.appendChild(section('Jelenlegi autó mentése', [h('div', { 'class': 'row' }, [
+          name,
+          btn('Mentés a garázsba', function () { post('saveCar', { name: name.value }); })
+        ])]));
+        var list = [];
+        if (!garage.length) list.push(h('div', { 'class': 'empty', text: 'A garázsod üres. Ülj be egy autóba, tuningold meg, és mentsd el!' }));
+        garage.forEach(function (c) {
+          list.push(h('div', { 'class': 'car' }, [
+            h('div', {}, [h('div', { 'class': 'nm', text: c.name }), h('div', { 'class': 'sub', text: c.label })]),
+            h('div', { 'class': 'acts' }, [
+              btn('Spawn', function () { post('loadCar', { id: c.id }); }),
+              btn('Törlés', function () { post('deleteCar', { id: c.id }); }, 'danger')
+            ])
+          ]));
+        });
+        box.appendChild(section('Garázs (' + garage.length + '/25)', list));
+      }
+
+      function renderPed() {
+        var box = el('content');
+        box.innerHTML = '';
+        var inp = h('input', { type: 'text', placeholder: 'Bármely ped modell (pl. s_m_y_cop_01)' });
+        var go = function () { if (inp.value.trim()) post('setPed', { model: inp.value.trim() }); };
+        inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') go(); });
+        box.appendChild(h('div', { 'class': 'row' }, [inp, btn('Alkalmaz', go), btn('Alap karakter', function () { post('resetPed'); }, 'danger')]));
+        var grid = h('div', { 'class': 'grid' }, PEDS.map(function (p) {
+          return btn(p[1], function () { post('setPed', { model: p[0] }); }, pedSaved === p[0] ? 'on' : '');
+        }));
+        box.appendChild(section('Karakterek (a választás mentődik)', [grid]));
+      }
+
+      /* ---------------- HUD ---------------- */
+      function setHud(d) {
+        el('street').textContent = d.street || '';
+        el('zone').textContent = d.zone || '';
+        el('pid').textContent = 'ID ' + d.id;
+        el('clock').textContent = d.clock;
+        el('hpfill').style.width = d.hp + '%';
+        el('arfill').style.width = d.armor + '%';
+        var sp = el('speedo');
+        if (d.inVeh) {
+          sp.classList.remove('hidden');
+          el('speed').textContent = d.speed;
+          el('gear').textContent = d.gear === 0 ? 'N' : d.gear;
+          el('rpmfill').style.width = Math.round((d.rpm || 0) * 100) + '%';
+          el('nitrofill').style.width = d.nitro + '%';
+          document.querySelector('.bar.nitro').classList.toggle('active', !!d.nitroActive);
+        } else {
+          sp.classList.add('hidden');
+        }
+        var dr = el('drift');
+        if (d.drift > 0) {
+          dr.classList.remove('hidden');
+          el('driftscore').textContent = d.drift;
+          el('driftbest').textContent = d.best;
+        } else {
+          dr.classList.add('hidden');
+        }
+      }
+
+      function toast(text) {
+        var t = h('div', { 'class': 'toast', text: text });
+        el('toasts').appendChild(t);
+        setTimeout(function () { t.remove(); }, 3800);
+      }
+
+      /* ---------------- MENU OPEN/CLOSE ---------------- */
+      function showMenu(startTab) {
+        menuOpen = true;
+        if (startTab) tab = startTab;
+        el('menu').classList.remove('hidden');
+        render();
+      }
+      function hideMenu() {
+        menuOpen = false;
+        el('menu').classList.add('hidden');
+      }
+
+      el('closebtn').addEventListener('click', function () { hideMenu(); post('close'); });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && menuOpen) { hideMenu(); post('close'); }
+      });
+
+      window.addEventListener('message', function (ev) {
+        var d = ev.data || {};
+        if (d.action === 'hud') setHud(d);
+        else if (d.action === 'open') showMenu(d.tab);
+        else if (d.action === 'close') hideMenu();
+        else if (d.action === 'toast') toast(d.text);
+        else if (d.action === 'data') {
+          garage = d.garage || [];
+          pedSaved = d.ped || null;
+          if (menuOpen && (tab === 'garage' || tab === 'ped')) render();
+        }
+      });
+
+  # 3) server.cfg
+  - action: write_file
+    file: ./server.cfg
+    data: |
+      # ===== Freeroam Drift & Fun =====
+      {{serverEndpoints}}
+
+      sv_maxclients {{maxClients}}
+      set steam_webApiKey ""
+      sv_licenseKey "{{svLicense}}"
+      set onesync on
+
+      sv_hostname "{{serverName}} | {{recipeName}}"
+      sets sv_projectName "{{serverName}}"
+      sets sv_projectDesc "{{recipeDescription}}"
+      sets tags "freeroam, drift, cars, fun, racing, hungarian"
+      sets locale "hu-HU"
+      load_server_icon icon.png
+
+      sv_scriptHookAllowed 0
+
+      # Alap resource-ok
+      ensure mapmanager
+      ensure chat
+      ensure spawnmanager
+      ensure sessionmanager
+      ensure hardcap
+      ensure rconlog
+      ensure baseevents
+
+      # Sajat freeroam resource (HUD, menu, garazs, ped, tuning, drift, nitro)
+      ensure freeroam
+
+      # Admin jogok (txAdmin kezeli az adminokat, ez csak a konzol-parancsokhoz kell)
+      add_ace group.admin command allow
+      add_ace group.admin command.quit deny
+      add_principal group.admin group.moderator
